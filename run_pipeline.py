@@ -4,12 +4,13 @@ import numpy as np
 import random
 import gc
 import os
+from collections import Counter
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import RobustScaler, StandardScaler
 from tqdm import tqdm
 
-from src.config import get_config, MODEL_REGISTRY
+from src.config import get_config, MODEL_REGISTRY, get_model_load_kwargs
 from src.data.loader import load_halueval, load_triviaqa
 from src.data.feature_extractor import extract_features
 from src.training.trainer import train_deep_model_fold, extract_features_batch
@@ -27,17 +28,29 @@ def stage_1_extract(args, config):
         samples = load_triviaqa(lang=args.lang, seed=config.seed)
         
     config.model_name = MODEL_REGISTRY[args.model]
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-    
+    load_kw = get_model_load_kwargs(args.model, config)
+    trc = load_kw["trust_remote_code"]
+    print(f"Loading {config.model_name} (dtype={load_kw['dtype']}, trust_remote_code={trc})")
+
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=trc)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # `torch_dtype` (not `dtype`) is used deliberately: it is honoured by both
+    # transformers 4.x and 5.x, whereas `dtype` does not exist in 4.x.
     model_llm = AutoModelForCausalLM.from_pretrained(
         config.model_name,
-        torch_dtype=config.model_dtype,
-        device_map="auto"
+        torch_dtype=load_kw["dtype"],
+        device_map="auto",
+        trust_remote_code=trc
     )
     model_llm.eval()
-    
+
+    n_layers = model_llm.config.num_hidden_layers
+    print(f"Model depth: {n_layers} layers -> sampling {config.n_sample_layers}")
+
     all_seq, all_glob, all_labels = [], [], []
+    fail_kinds = Counter()
     for i, sample in enumerate(tqdm(samples)):
         try:
             s, g = extract_features(sample['question'], sample['answer'], tokenizer, model_llm, config)
@@ -47,11 +60,35 @@ def stage_1_extract(args, config):
             if i > 0 and i % 500 == 0:
                 torch.cuda.empty_cache()
         except Exception as e:
+            fail_kinds[type(e).__name__] += 1
+            if sum(fail_kinds.values()) <= 3:
+                print(f"  sample {i} failed: {type(e).__name__}: {e}")
             continue
+
+    n_fail = sum(fail_kinds.values())
+    print(f"Extracted {len(all_seq)}/{len(samples)} samples (failed: {n_fail})")
+    if n_fail:
+        print(f"  failure types: {dict(fail_kinds)}")
+    if not all_seq:
+        raise RuntimeError("Every sample failed feature extraction - aborting.")
+    if n_fail > 0.05 * len(samples):
+        raise RuntimeError(
+            f"{n_fail}/{len(samples)} samples failed (>5%). Refusing to save "
+            f"features that would silently under-represent the dataset."
+        )
 
     X_seq = np.nan_to_num(np.array(all_seq), nan=0.0)
     X_glob = np.nan_to_num(np.array(all_glob), nan=0.0)
     y = np.array(all_labels)
+
+    # Health check. safe_stat() maps inf/NaN to 0.0, so a dtype overflow shows
+    # up as a flood of exact zeros or dead (constant) feature columns rather
+    # than as an exception.
+    zero_frac = float((X_seq == 0).mean())
+    dead_cols = int((X_seq.reshape(-1, X_seq.shape[-1]).std(axis=0) == 0).sum())
+    print(f"Feature health: shape={X_seq.shape}, zero_frac={zero_frac:.4f}, dead_cols={dead_cols}/{X_seq.shape[-1]}")
+    if zero_frac > 0.20 or dead_cols:
+        print("  WARNING: suspicious features - likely inf/NaN from a dtype mismatch.")
     
     os.makedirs('results/features', exist_ok=True)
     np.save(f'results/features/X_seq_{args.dataset}_{args.lang}_{args.model}.npy', X_seq)

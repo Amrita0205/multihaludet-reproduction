@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.metrics import roc_curve, precision_recall_curve, calibration_curve
+from sklearn.metrics import roc_curve, precision_recall_curve
+from sklearn.calibration import calibration_curve
 
 def plot_publication_results(probs, labels, preds, uncertainty_metrics, auc_score, ap_score, cm, filename):
     plt.style.use('seaborn-v0_8-whitegrid')

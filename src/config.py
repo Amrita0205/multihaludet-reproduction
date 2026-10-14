@@ -48,9 +48,44 @@ class Config:
     model_dtype      = torch.float16
 
 MODEL_REGISTRY = {
-    "mistral-7b" : "mistralai/Mistral-7B-Instruct-v0.2",
-    "llama2-7b"  : "meta-llama/Llama-2-7b-hf",
+    "mistral-7b"    : "mistralai/Mistral-7B-Instruct-v0.2",
+    "llama2-7b"     : "meta-llama/Llama-2-7b-hf",
+    # --- additional open-source probes (all <10B, ungated) ---
+    "qwen2.5-7b"    : "Qwen/Qwen2.5-7B-Instruct",
+    "phi3.5-mini"   : "microsoft/Phi-3.5-mini-instruct",
+    "yi1.5-9b"      : "01-ai/Yi-1.5-9B-Chat",
+    "qwen3-8b"      : "Qwen/Qwen3-8B",
+    "qwen2.5-3b"    : "Qwen/Qwen2.5-3B-Instruct",
+    "qwen2.5-1.5b"  : "Qwen/Qwen2.5-1.5B-Instruct",
+    "zephyr-7b"     : "HuggingFaceH4/zephyr-7b-beta",
+    "olmo2-7b"      : "allenai/OLMo-2-1124-7B-Instruct",
+    "internlm2.5-7b": "internlm/internlm2_5-7b-chat",
 }
+
+# Per-model load overrides, merged over "_default".
+# Default is bfloat16: every checkpoint above except the two originals is
+# natively bf16, and loading bf16 weights as fp16 can overflow to inf/NaN.
+# That failure is silent -- safe_stat() in feature_extractor.py turns
+# non-finite values into 0.0 -- so the dtype must be set per model.
+MODEL_OVERRIDES = {
+    "_default"      : {"dtype": torch.bfloat16},
+    "mistral-7b"    : {"dtype": torch.float16},   # keep published baseline reproducible
+    "llama2-7b"     : {"dtype": torch.float16},
+    # phi3.5-mini deliberately has no entry (so no trust_remote_code): its HF
+    # repo ships modeling code written for transformers 4.x
+    # (DynamicCache.from_legacy_cache, removed in v5). transformers has native
+    # Phi-3 support, so that is used instead.
+    "internlm2.5-7b": {"trust_remote_code": True},  # untested; may hit the same v5 issue
+}
+
+def get_model_load_kwargs(alias, config):
+    """Load options for `alias`: _default overridden by the model entry."""
+    merged = dict(MODEL_OVERRIDES.get("_default", {}))
+    merged.update(MODEL_OVERRIDES.get(alias, {}))
+    return {
+        "dtype": merged.get("dtype", config.model_dtype),
+        "trust_remote_code": merged.get("trust_remote_code", False),
+    }
 
 def get_config():
     return Config()

@@ -24,3 +24,6 @@ github.txt
 
 # OS
 .DS_Store
+
+# Private working notes (session logs, scratch) - never pushed
+session_notes/
